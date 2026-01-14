@@ -539,6 +539,7 @@ fn new_network_broadcast_exec(
             EmissionType::Incremental,
             Boundedness::Bounded,
         ),
+        worker_connections: WorkerConnectionPool::new(input_stage.tasks.len()),
         input_stage,
         metrics_collection: Default::default(),
     }
@@ -576,8 +577,8 @@ mod tests {
     use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::{
-        physical_expr::{expressions::col, expressions::Column, Partitioning, PhysicalSortExpr},
-        physical_plan::{displayable, sorts::sort::SortExec, union::UnionExec, ExecutionPlan},
+        physical_expr::{Partitioning, PhysicalSortExpr, expressions::Column, expressions::col},
+        physical_plan::{ExecutionPlan, displayable, sorts::sort::SortExec, union::UnionExec},
     };
 
     use datafusion::prelude::SessionContext;
