@@ -5,7 +5,7 @@ use crate::stage::Stage;
 use crate::worker::WorkerConnectionPool;
 use crate::{DistributedTaskContext, ExecutionTask, NetworkBoundary};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Result, plan_err};
+use datafusion::common::{Result, internal_datafusion_err, plan_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::Partitioning;
@@ -13,8 +13,7 @@ use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, ExecutionPlanProperties,
-    PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use std::any::Any;
 use std::fmt::Formatter;
@@ -247,7 +246,10 @@ impl ExecutionPlan for NetworkShuffleExec {
             producer_partition,
         }) = self.layout.resolve_slot(task_context.task_index, partition)
         else {
-            return Ok(Box::pin(EmptyRecordBatchStream::new(self.schema())));
+            return Err(internal_datafusion_err!(
+                "NetworkShuffleExec partition {partition} is out of range for task_index={}",
+                task_context.task_index
+            ));
         };
 
         let target_partition_range = task_context.task_index

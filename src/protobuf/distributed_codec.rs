@@ -81,7 +81,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema,
                 partitioning,
                 input_stage,
-                producer_task_count,
                 consumer_task_count,
                 partitions_per_consumer,
             }) => {
@@ -103,7 +102,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     partitioning,
                     Arc::new(schema),
                     parse_stage_proto(input_stage, inputs)?,
-                    producer_task_count as usize,
                     consumer_task_count as usize,
                     partitions_per_consumer as usize,
                 )?))
@@ -112,7 +110,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema,
                 partitioning,
                 input_stage,
-                producer_task_count,
                 consumer_task_count,
                 partitions_per_producer_task,
             }) => {
@@ -134,7 +131,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     partitioning,
                     Arc::new(schema),
                     parse_stage_proto(input_stage, inputs)?,
-                    producer_task_count as usize,
                     consumer_task_count as usize,
                     partitions_per_producer_task as usize,
                 )?))
@@ -158,7 +154,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                 schema,
                 partitioning,
                 input_stage,
-                producer_task_count,
                 consumer_task_count,
                 partitions_per_consumer,
             }) => {
@@ -180,7 +175,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     partitioning,
                     Arc::new(schema),
                     parse_stage_proto(input_stage, inputs)?,
-                    producer_task_count as usize,
                     consumer_task_count as usize,
                     partitions_per_consumer as usize,
                 )?))
@@ -265,7 +259,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     &DefaultPhysicalProtoConverter,
                 )?),
                 input_stage: Some(encode_stage_proto(node.input_stage())?),
-                producer_task_count: node.layout.producer_task_count() as u64,
                 consumer_task_count: node.layout.consumer_task_count() as u64,
                 partitions_per_consumer: node.layout.max_partition_count_per_consumer() as u64,
             };
@@ -284,7 +277,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     &DefaultPhysicalProtoConverter,
                 )?),
                 input_stage: Some(encode_stage_proto(node.input_stage())?),
-                producer_task_count: node.layout.producer_task_count() as u64,
                 consumer_task_count: node.layout.consumer_task_count() as u64,
                 partitions_per_producer_task: node.layout.partitions_per_producer_task() as u64,
             };
@@ -313,7 +305,6 @@ impl PhysicalExtensionCodec for DistributedCodec {
                     &DefaultPhysicalProtoConverter,
                 )?),
                 input_stage: Some(encode_stage_proto(node.input_stage())?),
-                producer_task_count: node.layout.producer_task_count() as u64,
                 consumer_task_count: node.layout.consumer_task_count() as u64,
                 partitions_per_consumer: node.layout.max_partition_count_per_consumer() as u64,
             };
@@ -424,8 +415,6 @@ pub struct NetworkShuffleExecProto {
     partitioning: Option<protobuf::Partitioning>,
     #[prost(message, optional, tag = "3")]
     input_stage: Option<StageProto>,
-    #[prost(uint64, tag = "4")]
-    producer_task_count: u64,
     #[prost(uint64, tag = "5")]
     consumer_task_count: u64,
     #[prost(uint64, tag = "6")]
@@ -460,10 +449,10 @@ fn new_network_hash_shuffle_exec_with_layout(
     partitioning: Partitioning,
     schema: SchemaRef,
     input_stage: Stage,
-    producer_task_count: usize,
     consumer_task_count: usize,
     partitions_per_consumer: usize,
 ) -> Result<NetworkShuffleExec> {
+    let producer_task_count = input_stage.tasks.len();
     Ok(NetworkShuffleExec {
         properties: Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -492,8 +481,6 @@ pub struct NetworkCoalesceExecProto {
     partitioning: Option<protobuf::Partitioning>,
     #[prost(message, optional, tag = "3")]
     input_stage: Option<StageProto>,
-    #[prost(uint64, tag = "4")]
-    producer_task_count: u64,
     #[prost(uint64, tag = "5")]
     consumer_task_count: u64,
     #[prost(uint64, tag = "6")]
@@ -504,10 +491,10 @@ fn new_network_coalesce_tasks_exec_with_layout(
     partitioning: Partitioning,
     schema: SchemaRef,
     input_stage: Stage,
-    producer_task_count: usize,
     consumer_task_count: usize,
     partitions_per_producer_task: usize,
 ) -> Result<NetworkCoalesceExec> {
+    let producer_task_count = input_stage.tasks.len();
     Ok(NetworkCoalesceExec {
         properties: Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -533,8 +520,6 @@ pub struct NetworkBroadcastExecProto {
     partitioning: Option<protobuf::Partitioning>,
     #[prost(message, optional, tag = "3")]
     input_stage: Option<StageProto>,
-    #[prost(uint64, tag = "4")]
-    producer_task_count: u64,
     #[prost(uint64, tag = "5")]
     consumer_task_count: u64,
     #[prost(uint64, tag = "6")]
@@ -551,10 +536,10 @@ fn new_network_broadcast_exec_with_layout(
     partitioning: Partitioning,
     schema: SchemaRef,
     input_stage: Stage,
-    producer_task_count: usize,
     consumer_task_count: usize,
     partitions_per_consumer: usize,
 ) -> Result<NetworkBroadcastExec> {
+    let producer_task_count = input_stage.tasks.len();
     Ok(NetworkBroadcastExec {
         properties: Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
@@ -620,7 +605,7 @@ mod tests {
             query_id: Default::default(),
             num: 0,
             plan: None,
-            tasks: vec![],
+            tasks: vec![ExecutionTask { url: None }],
         }
     }
 
@@ -638,7 +623,7 @@ mod tests {
             query_id: Default::default(),
             num: 0,
             plan: Some(empty_exec()),
-            tasks: vec![],
+            tasks: vec![ExecutionTask { url: None }],
         }
     }
 
@@ -659,13 +644,11 @@ mod tests {
         schema: SchemaRef,
         input_stage: Stage,
     ) -> NetworkShuffleExec {
-        let producer_task_count = input_stage.tasks.len().max(1);
         let partitions_per_consumer = partitioning.partition_count();
         new_network_hash_shuffle_exec_with_layout(
             partitioning,
             schema,
             input_stage,
-            producer_task_count,
             1,
             partitions_per_consumer,
         )
@@ -677,13 +660,11 @@ mod tests {
         schema: SchemaRef,
         input_stage: Stage,
     ) -> NetworkCoalesceExec {
-        let producer_task_count = input_stage.tasks.len().max(1);
         let partitions_per_producer_task = partitioning.partition_count();
         new_network_coalesce_tasks_exec_with_layout(
             partitioning,
             schema,
             input_stage,
-            producer_task_count,
             1,
             partitions_per_producer_task,
         )
@@ -695,13 +676,11 @@ mod tests {
         schema: SchemaRef,
         input_stage: Stage,
     ) -> NetworkBroadcastExec {
-        let producer_task_count = input_stage.tasks.len().max(1);
         let partitions_per_consumer = partitioning.partition_count();
         new_network_broadcast_exec_with_layout(
             partitioning,
             schema,
             input_stage,
-            producer_task_count,
             1,
             partitions_per_consumer,
         )
@@ -719,7 +698,6 @@ mod tests {
             partitioning,
             schema,
             dummy_stage_with_tasks(2),
-            2,
             3,
             4,
         )?);
@@ -758,7 +736,6 @@ mod tests {
             Partitioning::UnknownPartitioning(9),
             schema,
             dummy_stage_with_tasks(5),
-            5,
             2,
             3,
         )?);
@@ -799,7 +776,6 @@ mod tests {
             Partitioning::UnknownPartitioning(4),
             schema,
             dummy_stage_with_tasks(2),
-            2,
             3,
             4,
         )?);
