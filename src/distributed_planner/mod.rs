@@ -1,5 +1,6 @@
 mod distribute_plan;
 mod distributed_config;
+mod exchange_assignment;
 mod insert_broadcast;
 mod network_boundary;
 mod partial_reduce_below_network_shuffles;
@@ -8,6 +9,7 @@ mod session_state_builder_ext;
 mod task_estimator;
 
 pub use distributed_config::DistributedConfig;
+pub(crate) use exchange_assignment::{ExchangeLayout, SlotReadPlan};
 pub use network_boundary::{NetworkBoundary, NetworkBoundaryExt};
 pub use session_state_builder_ext::SessionStateBuilderExt;
 pub use task_estimator::{TaskCountAnnotation, TaskEstimation, TaskEstimator, TaskRoutingContext};

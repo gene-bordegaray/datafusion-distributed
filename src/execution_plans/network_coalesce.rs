@@ -1,5 +1,5 @@
 use crate::common::require_one_child;
-use crate::distributed_planner::NetworkBoundary;
+use crate::distributed_planner::{ExchangeLayout, NetworkBoundary, SlotReadPlan};
 use crate::execution_plans::common::scale_partitioning_props;
 use crate::stage::Stage;
 use crate::worker::WorkerConnectionPool;
@@ -11,7 +11,6 @@ use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, PlanProperties,
-    internal_err,
 };
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -77,6 +76,7 @@ pub struct NetworkCoalesceExec {
     pub(crate) properties: Arc<PlanProperties>,
     pub(crate) input_stage: Stage,
     pub(crate) worker_connections: WorkerConnectionPool,
+    pub(crate) layout: Arc<ExchangeLayout>,
 }
 
 impl NetworkCoalesceExec {
@@ -86,6 +86,9 @@ impl NetworkCoalesceExec {
     /// partitions into one, for example:
     /// - [CoalescePartitionsExec]
     /// - [SortPreservingMergeExec]
+    ///
+    /// This count-based constructor keeps the public API stable; the distributed planner uses
+    /// [Self::try_new_from_layout] after deriving the exchange layout explicitly.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         query_id: Uuid,
@@ -93,14 +96,27 @@ impl NetworkCoalesceExec {
         task_count: usize,
         input_task_count: usize,
     ) -> Result<Self> {
-        if task_count == 0 {
-            return plan_err!("NetworkCoalesceExec cannot be executed with task_count=0");
+        let layout = ExchangeLayout::try_coalesce(
+            input_task_count,
+            task_count,
+            input.properties().partitioning.partition_count(),
+        )?;
+        Self::try_new_from_layout(input, query_id, num, layout)
+    }
+
+    /// Builds a coalesce boundary from an already-derived exchange layout.
+    pub(crate) fn try_new_from_layout(
+        input: Arc<dyn ExecutionPlan>,
+        query_id: Uuid,
+        num: usize,
+        layout: Arc<ExchangeLayout>,
+    ) -> Result<Self> {
+        if !matches!(layout.as_ref(), ExchangeLayout::Coalesce(_)) {
+            return plan_err!("NetworkCoalesceExec requires a coalesce exchange layout");
         }
 
-        // Each output task coalesces a group of input tasks. We size the output partition count
-        // per output task based on the maximum group size, returning empty streams for tasks with
-        // smaller groups.
-        let max_input_task_count = input_task_count.div_ceil(task_count).max(1);
+        let input_task_count = layout.producer_task_count();
+        let max_input_task_count = layout.max_input_task_count_per_consumer().unwrap_or(0);
         Ok(Self {
             properties: scale_partitioning_props(input.properties(), |p| p * max_input_task_count),
             input_stage: Stage {
@@ -110,6 +126,7 @@ impl NetworkCoalesceExec {
                 tasks: vec![ExecutionTask { url: None }; input_task_count],
             },
             worker_connections: WorkerConnectionPool::new(input_task_count),
+            layout,
         })
     }
 }
@@ -181,60 +198,22 @@ impl ExecutionPlan for NetworkCoalesceExec {
             );
         }
 
-        let partitions_per_task = self
-            .properties()
-            .partitioning
-            .partition_count()
-            .checked_div(
-                self.input_stage
-                    .tasks
-                    .len()
-                    .div_ceil(task_context.task_count)
-                    .max(1),
-            )
-            .unwrap_or(0);
-        if partitions_per_task == 0 {
-            return exec_err!("NetworkCoalesceExec has 0 partitions per input task");
-        }
-
-        let input_task_count = self.input_stage.tasks.len();
-        let group = task_group(
-            input_task_count,
-            task_context.task_index,
-            task_context.task_count,
-        );
-
-        let input_task_offset = partition / partitions_per_task;
-        let target_partition = partition % partitions_per_task;
-
-        // Some consumer tasks are assigned fewer upstream tasks when
-        // `input_task_count % task_count != 0` (uneven grouping).
-        // We still size partitions based on the maximum group size, so partitions that
-        // would map to a missing upstream task slot are treated as padding and return
-        // an empty stream (no network call).
-        if input_task_offset >= group.len {
+        let Some(SlotReadPlan::Single {
+            producer_task,
+            producer_partition,
+        }) = self.layout.resolve_slot(task_context.task_index, partition)
+        else {
             return Ok(Box::pin(EmptyRecordBatchStream::new(self.schema())));
-        }
-
-        // This should never happen.
-        if input_task_offset >= group.max_len {
-            return internal_err!(
-                "NetworkCoalesceExec input_task_offset={} >= group.max_len={}",
-                input_task_offset,
-                group.max_len
-            );
-        }
-
-        let target_task = group.start_task + input_task_offset;
+        };
 
         let worker_connection = self.worker_connections.get_or_init_worker_connection(
             &self.input_stage,
-            0..partitions_per_task,
-            target_task,
+            0..self.layout.partitions_per_producer_task(),
+            producer_task,
             &context,
         )?;
 
-        let stream = worker_connection.stream_partition(target_partition, |_meta| {})?;
+        let stream = worker_connection.stream_partition(producer_partition, |_meta| {})?;
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -244,47 +223,6 @@ impl ExecutionPlan for NetworkCoalesceExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.worker_connections.metrics.clone_inner())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TaskGroup {
-    /// The first input task index in this group.
-    start_task: usize,
-    /// The number of input tasks in this group.
-    len: usize,
-    /// The maximum possible group size across all groups.
-    ///
-    /// When groups are uneven (input_tasks % task_count != 0), some groups are shorter. We still
-    /// size the output partitioning based on this max and return empty streams for the extra
-    /// partitions in smaller groups.
-    max_len: usize,
-}
-
-/// Returns the contiguous group of input tasks assigned to DistributedTaskContext::task_index.
-fn task_group(input_task_count: usize, task_index: usize, task_count: usize) -> TaskGroup {
-    if task_count == 0 {
-        return TaskGroup {
-            start_task: 0,
-            len: 0,
-            max_len: 0,
-        };
-    }
-
-    // Split `input_task_count` into `task_count` contiguous groups.
-    // - base_tasks_per_group: floor(input_task_count / task_count)
-    // - groups_with_extra_task: first N groups that get one extra task (remainder)
-    let base_tasks_per_group = input_task_count / task_count;
-    let groups_with_extra_task = input_task_count % task_count;
-
-    let len = base_tasks_per_group + usize::from(task_index < groups_with_extra_task);
-    let start_task = (task_index * base_tasks_per_group) + task_index.min(groups_with_extra_task);
-    let max_len = base_tasks_per_group + usize::from(groups_with_extra_task > 0);
-
-    TaskGroup {
-        start_task,
-        len,
-        max_len,
     }
 }
 
@@ -325,12 +263,13 @@ mod tests {
         let child: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
         let child_partitions = child.properties().partitioning.partition_count();
 
-        let exec = NetworkCoalesceExec::try_new(
+        let layout =
+            ExchangeLayout::try_coalesce(case.input_tasks, case.consumer_tasks, child_partitions)?;
+        let exec = NetworkCoalesceExec::try_new_from_layout(
             Arc::clone(&child),
             Uuid::nil(),
             STAGE_NUM,
-            case.consumer_tasks,
-            case.input_tasks,
+            layout,
         )?;
 
         // Output partitions are sized by the maximum group size.

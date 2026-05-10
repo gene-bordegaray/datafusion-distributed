@@ -1,6 +1,6 @@
 use crate::DistributedTaskContext;
 use crate::common::require_one_child;
-use crate::distributed_planner::NetworkBoundary;
+use crate::distributed_planner::{ExchangeLayout, NetworkBoundary, SlotReadPlan};
 use crate::stage::Stage;
 use crate::worker::WorkerConnectionPool;
 use datafusion::common::internal_datafusion_err;
@@ -120,6 +120,7 @@ pub struct NetworkBroadcastExec {
     pub(crate) properties: Arc<PlanProperties>,
     pub(crate) input_stage: Stage,
     pub(crate) worker_connections: WorkerConnectionPool,
+    pub(crate) layout: Arc<ExchangeLayout>,
 }
 
 impl NetworkBroadcastExec {
@@ -127,6 +128,8 @@ impl NetworkBroadcastExec {
     ///
     /// Extracts its child, a BroadcastExec, and creates a new BroadcastExec with
     /// the correct consumer_task_count.
+    /// This count-based constructor keeps the public API stable; the distributed planner uses
+    /// [Self::try_new_from_layout] after deriving the exchange layout explicitly.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         query_id: Uuid,
@@ -140,21 +143,57 @@ impl NetworkBroadcastExec {
                 input.name()
             ));
         };
+        let child = require_one_child(broadcast.children())?;
+        let layout = ExchangeLayout::try_broadcast(
+            input_task_count,
+            consumer_task_count,
+            child.properties().partitioning.partition_count(),
+        )?;
+        Self::try_new_from_layout(input, query_id, stage_num, layout)
+    }
+
+    /// Builds a broadcast boundary from an already-derived exchange layout.
+    pub(crate) fn try_new_from_layout(
+        input: Arc<dyn ExecutionPlan>,
+        query_id: Uuid,
+        stage_num: usize,
+        layout: Arc<ExchangeLayout>,
+    ) -> Result<Self, DataFusionError> {
+        if !matches!(layout.as_ref(), ExchangeLayout::Broadcast(_)) {
+            return Err(internal_datafusion_err!(
+                "NetworkBroadcastExec requires a broadcast exchange layout"
+            ));
+        }
+
+        let Some(broadcast) = input.as_any().downcast_ref::<super::BroadcastExec>() else {
+            return Err(internal_datafusion_err!(
+                "NetworkBroadcastExec requires a BroadcastExec input, found: {}",
+                input.name()
+            ));
+        };
 
         let child = require_one_child(broadcast.children())?;
         let input_partition_count = child.properties().partitioning.partition_count();
-        let broadcast_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(super::BroadcastExec::new(child, consumer_task_count));
+        let broadcast_exec: Arc<dyn ExecutionPlan> = Arc::new(super::BroadcastExec::new(
+            child,
+            layout.consumer_task_count(),
+        ));
 
         let properties = <PlanProperties as Clone>::clone(&input.properties().clone())
             .with_partitioning(Partitioning::UnknownPartitioning(input_partition_count));
 
-        let input_stage = Stage::new(query_id, stage_num, broadcast_exec, input_task_count);
+        let input_stage = Stage::new(
+            query_id,
+            stage_num,
+            broadcast_exec,
+            layout.producer_task_count(),
+        );
 
         Ok(Self {
             properties: properties.into(),
             input_stage,
-            worker_connections: WorkerConnectionPool::new(input_task_count),
+            worker_connections: WorkerConnectionPool::new(layout.producer_task_count()),
+            layout,
         })
     }
 }
@@ -227,18 +266,30 @@ impl ExecutionPlan for NetworkBroadcastExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let off = self.properties.partitioning.partition_count() * task_context.task_index;
-        let mut streams = Vec::with_capacity(self.input_stage.tasks.len());
+        let Some(SlotReadPlan::Fanout {
+            producer_tasks,
+            producer_partition,
+        }) = self.layout.resolve_slot(task_context.task_index, partition)
+        else {
+            return Err(internal_datafusion_err!(
+                "NetworkBroadcastExec partition {partition} is out of range for task_index={}",
+                task_context.task_index
+            ));
+        };
 
-        for input_task_index in 0..self.input_stage.tasks.len() {
+        let target_partition_range = task_context.task_index
+            * self.properties.partitioning.partition_count()
+            ..(task_context.task_index + 1) * self.properties.partitioning.partition_count();
+        let mut streams = Vec::with_capacity(producer_tasks.len());
+        for input_task_index in producer_tasks {
             let worker_connection = self.worker_connections.get_or_init_worker_connection(
                 &self.input_stage,
-                off..(off + self.properties.partitioning.partition_count()),
+                target_partition_range.clone(),
                 input_task_index,
                 &context,
             )?;
 
-            let stream = worker_connection.stream_partition(off + partition, |_meta| {})?;
+            let stream = worker_connection.stream_partition(producer_partition, |_meta| {})?;
             streams.push(stream);
         }
 

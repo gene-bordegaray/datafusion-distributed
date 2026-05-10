@@ -2,6 +2,7 @@ use super::fixture::{
     InMemoryChannelsResolver, benchmark_schema, make_input_partitions, rows_for_producer,
 };
 use crate::common::task_ctx_with_extension;
+use crate::distributed_planner::ExchangeLayout;
 use crate::worker::WorkerConnectionPool;
 use crate::worker::test_utils::worker_handles::MemoryWorkerHandle;
 use crate::{DistributedExt, DistributedTaskContext, ExecutionTask, NetworkShuffleExec, Stage};
@@ -231,6 +232,11 @@ impl ShuffleFixture {
                 )),
                 input_stage: input_stage.clone(),
                 worker_connections: WorkerConnectionPool::new(self.bench.producer_tasks),
+                layout: ExchangeLayout::try_shuffle(
+                    self.bench.producer_tasks,
+                    self.bench.consumer_tasks,
+                    self.bench.partitions,
+                )?,
             };
             let task_ctx = Arc::new(task_ctx_with_extension(
                 &self.task_ctx,

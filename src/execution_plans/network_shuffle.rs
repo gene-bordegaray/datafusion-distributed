@@ -1,4 +1,5 @@
 use crate::common::require_one_child;
+use crate::distributed_planner::{ExchangeLayout, SlotReadPlan};
 use crate::execution_plans::common::scale_partitioning;
 use crate::stage::Stage;
 use crate::worker::WorkerConnectionPool;
@@ -12,7 +13,8 @@ use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties,
 };
 use std::any::Any;
 use std::fmt::Formatter;
@@ -105,6 +107,7 @@ pub struct NetworkShuffleExec {
     pub(crate) properties: Arc<PlanProperties>,
     pub(crate) input_stage: Stage,
     pub(crate) worker_connections: WorkerConnectionPool,
+    pub(crate) layout: Arc<ExchangeLayout>,
 }
 
 impl NetworkShuffleExec {
@@ -112,6 +115,8 @@ impl NetworkShuffleExec {
     ///
     /// Typically, the `input` to this
     /// node is a [RepartitionExec] with a [Partitioning::Hash] partition scheme.
+    /// This count-based constructor keeps the public API stable; the distributed planner uses
+    /// [Self::try_new_from_layout] after deriving the exchange layout explicitly.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         query_id: Uuid,
@@ -119,10 +124,30 @@ impl NetworkShuffleExec {
         task_count: usize,
         input_task_count: usize,
     ) -> Result<Self, DataFusionError> {
+        let layout = ExchangeLayout::try_shuffle(
+            input_task_count,
+            task_count,
+            input.output_partitioning().partition_count(),
+        )?;
+        Self::try_new_from_layout(input, query_id, num, layout)
+    }
+
+    /// Builds a shuffle boundary from an already-derived exchange layout.
+    pub(crate) fn try_new_from_layout(
+        input: Arc<dyn ExecutionPlan>,
+        query_id: Uuid,
+        num: usize,
+        layout: Arc<ExchangeLayout>,
+    ) -> Result<Self, DataFusionError> {
+        if !matches!(layout.as_ref(), ExchangeLayout::Shuffle(_)) {
+            return plan_err!("NetworkShuffleExec requires a shuffle exchange layout");
+        }
         if !matches!(input.output_partitioning(), Partitioning::Hash(_, _)) {
             return plan_err!("NetworkShuffleExec input must be hash partitioned");
         }
 
+        let input_task_count = layout.producer_task_count();
+        let task_count = layout.consumer_task_count();
         let transformed = Arc::clone(&input).transform_down(|plan| {
             if let Some(r_exe) = plan.as_any().downcast_ref::<RepartitionExec>() {
                 // Scale the input RepartitionExec to account for all the tasks to which it will
@@ -153,6 +178,7 @@ impl NetworkShuffleExec {
             },
             worker_connections: WorkerConnectionPool::new(input_task_count),
             properties: input.properties().clone(),
+            layout,
         })
     }
 }
@@ -216,18 +242,27 @@ impl ExecutionPlan for NetworkShuffleExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let off = self.properties.partitioning.partition_count() * task_context.task_index;
+        let Some(SlotReadPlan::Fanout {
+            producer_tasks,
+            producer_partition,
+        }) = self.layout.resolve_slot(task_context.task_index, partition)
+        else {
+            return Ok(Box::pin(EmptyRecordBatchStream::new(self.schema())));
+        };
 
-        let mut streams = Vec::with_capacity(self.input_stage.tasks.len());
-        for input_task_index in 0..self.input_stage.tasks.len() {
+        let target_partition_range = task_context.task_index
+            * self.properties.partitioning.partition_count()
+            ..(task_context.task_index + 1) * self.properties.partitioning.partition_count();
+        let mut streams = Vec::with_capacity(producer_tasks.len());
+        for input_task_index in producer_tasks {
             let worker_connection = self.worker_connections.get_or_init_worker_connection(
                 &self.input_stage,
-                off..(off + self.properties.partitioning.partition_count()),
+                target_partition_range.clone(),
                 input_task_index,
                 &context,
             )?;
 
-            let stream = worker_connection.stream_partition(off + partition, |_meta| {})?;
+            let stream = worker_connection.stream_partition(producer_partition, |_meta| {})?;
             streams.push(stream);
         }
 

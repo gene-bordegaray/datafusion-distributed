@@ -2,6 +2,7 @@ use super::fixture::{
     InMemoryChannelsResolver, benchmark_schema, make_input_partitions, rows_for_producer,
 };
 use crate::common::task_ctx_with_extension;
+use crate::distributed_planner::ExchangeLayout;
 use crate::worker::test_utils::worker_handles::{MemoryWorkerHandle, TcpWorkerHandle};
 use crate::{
     DefaultChannelResolver, DistributedExt, DistributedTaskContext, ExecutionTask,
@@ -289,6 +290,11 @@ impl TransportFixture {
                 worker_connections: crate::worker::WorkerConnectionPool::new(
                     self.bench.producer_tasks,
                 ),
+                layout: ExchangeLayout::try_shuffle(
+                    self.bench.producer_tasks,
+                    self.bench.consumer_tasks,
+                    self.bench.partitions,
+                )?,
             };
             let task_ctx = Arc::new(task_ctx_with_extension(
                 &self.task_ctx,

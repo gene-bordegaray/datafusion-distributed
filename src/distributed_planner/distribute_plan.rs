@@ -1,4 +1,5 @@
 use crate::common::require_one_child;
+use crate::distributed_planner::ExchangeLayout;
 use crate::distributed_planner::insert_broadcast::insert_broadcast_execs;
 use crate::distributed_planner::partial_reduce_below_network_shuffles::partial_reduce_below_network_shuffles;
 use crate::distributed_planner::plan_annotator::{
@@ -115,12 +116,14 @@ fn _distribute_plan(
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkShuffleExec::try_new(
-                require_one_child(new_children)?,
-                query_id,
-                *stage_id,
-                task_count,
+            let input = require_one_child(new_children)?;
+            let layout = ExchangeLayout::try_shuffle(
                 max_child_task_count.unwrap_or(1),
+                task_count,
+                input.output_partitioning().partition_count(),
+            )?;
+            let node = Arc::new(NetworkShuffleExec::try_new_from_layout(
+                input, query_id, *stage_id, layout,
             )?);
             stage_id.add_assign(1);
             Ok(node)
@@ -133,12 +136,14 @@ fn _distribute_plan(
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkCoalesceExec::try_new(
-                require_one_child(new_children)?,
-                query_id,
-                *stage_id,
-                task_count,
+            let input = require_one_child(new_children)?;
+            let layout = ExchangeLayout::try_coalesce(
                 max_child_task_count.unwrap_or(1),
+                task_count,
+                input.properties().partitioning.partition_count(),
+            )?;
+            let node = Arc::new(NetworkCoalesceExec::try_new_from_layout(
+                input, query_id, *stage_id, layout,
             )?);
             stage_id.add_assign(1);
             Ok(node)
@@ -151,12 +156,21 @@ fn _distribute_plan(
             if task_count == 1 && max_child_task_count == Some(1) {
                 return require_one_child(new_children);
             }
-            let node = Arc::new(NetworkBroadcastExec::try_new(
-                require_one_child(new_children)?,
-                query_id,
-                *stage_id,
-                task_count,
+            let input = require_one_child(new_children)?;
+            let Some(broadcast) = input.as_any().downcast_ref::<crate::BroadcastExec>() else {
+                return datafusion::common::internal_err!(
+                    "NetworkBroadcastExec requires a BroadcastExec input, found: {}",
+                    input.name()
+                );
+            };
+            let child = require_one_child(broadcast.children())?;
+            let layout = ExchangeLayout::try_broadcast(
                 max_child_task_count.unwrap_or(1),
+                task_count,
+                child.properties().partitioning.partition_count(),
+            )?;
+            let node = Arc::new(NetworkBroadcastExec::try_new_from_layout(
+                input, query_id, *stage_id, layout,
             )?);
             stage_id.add_assign(1);
             Ok(node)
