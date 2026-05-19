@@ -4,14 +4,16 @@ use crate::stage::{LocalStage, Stage};
 use crate::worker::WorkerConnectionPool;
 use crate::{DistributedTaskContext, NetworkBoundary};
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
-use datafusion::common::{Result, not_impl_err, plan_err};
+use datafusion::common::{Result, exec_err, not_impl_err, plan_err};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_expr_common::metrics::MetricsSet;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan, PlanProperties,
+};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::ops::Range;
@@ -110,19 +112,18 @@ impl NetworkShuffleExec {
     pub(crate) fn scale_input(
         plan: Arc<dyn ExecutionPlan>,
         consumer_partitions: usize,
-        consumer_task_count: usize,
+        _consumer_task_count: usize,
     ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
         let Some(repartition_exec) = plan.as_any().downcast_ref::<RepartitionExec>() else {
             return Ok(Transformed::no(plan));
         };
 
         let child = require_one_child(repartition_exec.children())?;
-        let partitioning = scale_partitioning(repartition_exec.partitioning(), |_| {
-            consumer_partitions * consumer_task_count
-        });
+        let partitioning =
+            scale_partitioning(repartition_exec.partitioning(), |_| consumer_partitions);
 
-        // Scale the input RepartitionExec to account for all the tasks to which it will
-        // need to fan data out.
+        // Keep one logical hash partition space across all consumer tasks. Each consumer task
+        // fetches only the subset of those logical partitions that it owns.
         let scaled = Arc::new(RepartitionExec::try_new(child, partitioning)?);
         Ok(Transformed::new(scaled, true, TreeNodeRecursion::Stop))
     }
@@ -157,7 +158,6 @@ impl NetworkShuffleExec {
     }
 }
 
-#[allow(dead_code)]
 fn consumer_partition_range(
     logical_partition_count: usize,
     consumer_task_count: usize,
@@ -175,7 +175,6 @@ fn consumer_partition_range(
     Some(start..start + len)
 }
 
-#[allow(dead_code)]
 fn consumer_owns_partition(partition_range: &Range<usize>, partition: usize) -> bool {
     partition >= partition_range.start && partition < partition_range.end
 }
@@ -250,18 +249,32 @@ impl ExecutionPlan for NetworkShuffleExec {
         };
 
         let task_context = DistributedTaskContext::from_ctx(&context);
-        let off = self.properties.partitioning.partition_count() * task_context.task_index;
+        let Some(partition_range) = consumer_partition_range(
+            self.properties.partitioning.partition_count(),
+            task_context.task_count,
+            task_context.task_index,
+        ) else {
+            return exec_err!(
+                "NetworkShuffleExec invalid task context: task_index={} task_count={}",
+                task_context.task_index,
+                task_context.task_count
+            );
+        };
+
+        if !consumer_owns_partition(&partition_range, partition) {
+            return Ok(Box::pin(EmptyRecordBatchStream::new(self.schema())));
+        }
 
         let mut streams = Vec::with_capacity(remote_stage.workers.len());
         for input_task_index in 0..remote_stage.workers.len() {
             let worker_connection = self.worker_connections.get_or_init_worker_connection(
                 remote_stage,
-                off..(off + self.properties.partitioning.partition_count()),
+                partition_range.clone(),
                 input_task_index,
                 &context,
             )?;
 
-            let stream = worker_connection.stream_partition(off + partition, |_meta| {})?;
+            let stream = worker_connection.stream_partition(partition, |_meta| {})?;
             streams.push(stream);
         }
 
