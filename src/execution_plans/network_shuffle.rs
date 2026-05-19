@@ -14,6 +14,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use std::any::Any;
 use std::fmt::Formatter;
+use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -156,6 +157,29 @@ impl NetworkShuffleExec {
     }
 }
 
+#[allow(dead_code)]
+fn consumer_partition_range(
+    logical_partition_count: usize,
+    consumer_task_count: usize,
+    consumer_task_index: usize,
+) -> Option<Range<usize>> {
+    if consumer_task_count == 0 || consumer_task_index >= consumer_task_count {
+        return None;
+    }
+
+    let base = logical_partition_count / consumer_task_count;
+    let extra = logical_partition_count % consumer_task_count;
+    let start = consumer_task_index * base + consumer_task_index.min(extra);
+    let len = base + usize::from(consumer_task_index < extra);
+
+    Some(start..start + len)
+}
+
+#[allow(dead_code)]
+fn consumer_owns_partition(partition_range: &Range<usize>, partition: usize) -> bool {
+    partition >= partition_range.start && partition < partition_range.end
+}
+
 impl NetworkBoundary for NetworkShuffleExec {
     fn input_stage(&self) -> &Stage {
         &self.input_stage
@@ -249,5 +273,43 @@ impl ExecutionPlan for NetworkShuffleExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.worker_connections.metrics.clone_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{consumer_owns_partition, consumer_partition_range};
+
+    #[test]
+    fn consumer_partition_range_splits_partitions_evenly() {
+        assert_eq!(consumer_partition_range(8, 2, 0), Some(0..4));
+        assert_eq!(consumer_partition_range(8, 2, 1), Some(4..8));
+
+        assert_eq!(consumer_partition_range(10, 3, 0), Some(0..4));
+        assert_eq!(consumer_partition_range(10, 3, 1), Some(4..7));
+        assert_eq!(consumer_partition_range(10, 3, 2), Some(7..10));
+    }
+
+    #[test]
+    fn consumer_partition_range_allows_more_consumers_than_partitions() {
+        assert_eq!(consumer_partition_range(2, 4, 0), Some(0..1));
+        assert_eq!(consumer_partition_range(2, 4, 1), Some(1..2));
+        assert_eq!(consumer_partition_range(2, 4, 2), Some(2..2));
+        assert_eq!(consumer_partition_range(2, 4, 3), Some(2..2));
+    }
+
+    #[test]
+    fn consumer_partition_range_rejects_invalid_consumers() {
+        assert_eq!(consumer_partition_range(4, 0, 0), None);
+        assert_eq!(consumer_partition_range(4, 2, 2), None);
+    }
+
+    #[test]
+    fn consumer_owns_partition_checks_half_open_range() {
+        assert!(!consumer_owns_partition(&(2..5), 1));
+        assert!(consumer_owns_partition(&(2..5), 2));
+        assert!(consumer_owns_partition(&(2..5), 4));
+        assert!(!consumer_owns_partition(&(2..5), 5));
+        assert!(!consumer_owns_partition(&(2..2), 2));
     }
 }
