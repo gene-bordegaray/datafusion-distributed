@@ -8,6 +8,10 @@ use datafusion::config::{ConfigExtension, ConfigField, ConfigOptions, Visit};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+pub const LOCAL_EXCHANGE_SPLIT_MODE_OFF: &str = "off";
+pub const LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG: &str = "final_agg";
+pub const LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG_AND_JOIN: &str = "final_agg_and_join";
+
 extensions_options! {
     /// Configuration for the distributed planner.
     pub struct DistributedConfig {
@@ -65,6 +69,20 @@ extensions_options! {
         /// budget will still be admitted (otherwise we would livelock), so the actual peak per
         /// connection is `worker_connection_buffer_budget_bytes + max_message_size`.
         pub worker_connection_buffer_budget_bytes: usize, default = 64 * 1024 * 1024
+        /// Controls which consumer operators trigger a [crate::LocalExchangeSplitExec].
+        /// Valid values (case-insensitive):
+        /// - `"off"`: disable the optimization.
+        /// - `"final_agg"`: split only above `FinalPartitioned` aggregates.
+        /// - `"final_agg_and_join"`: split above `FinalPartitioned` aggregates and
+        ///   `Partitioned` hash joins.
+        pub local_exchange_split_mode: String, default = local_exchange_split_mode_default()
+        /// Maximum number of shuffle partitions a consumer task may own before the split
+        /// optimization is skipped for that shuffle. Tasks that already own many partitions have
+        /// adequate local parallelism from the shuffle itself.
+        pub local_exchange_split_max_owned_partitions: usize, default = 3
+        /// Target output partition count per consumer task after splitting. The actual count is
+        /// rounded up to the next count the input boundary can produce.
+        pub local_exchange_split_target_partitions_per_task: usize, default = 8
         /// Collection of [TaskEstimator]s that will be applied to leaf nodes in order to
         /// estimate how many tasks should be spawned for the [Stage] containing the leaf node.
         pub(crate) __private_task_estimator: CombinedTaskEstimator, default = CombinedTaskEstimator::default()
@@ -96,6 +114,10 @@ fn cardinality_task_count_factor_default() -> f64 {
     }
 }
 
+fn local_exchange_split_mode_default() -> String {
+    LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG_AND_JOIN.to_string()
+}
+
 impl DistributedConfig {
     /// Appends a [TaskEstimator] to the list. [TaskEstimator] will be executed sequentially in
     /// order on leaf nodes, and the first one to provide a value is the one that gets to decide
@@ -108,6 +130,47 @@ impl DistributedConfig {
             .user_provided
             .push(Arc::new(task_estimator));
         self
+    }
+
+    fn local_exchange_split_mode_is_final_agg(&self) -> bool {
+        self.local_exchange_split_mode
+            .eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG)
+    }
+
+    pub fn local_exchange_split_mode_is_off(&self) -> bool {
+        self.local_exchange_split_mode
+            .eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_OFF)
+    }
+
+    fn local_exchange_split_mode_is_final_agg_and_join(&self) -> bool {
+        self.local_exchange_split_mode
+            .eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG_AND_JOIN)
+    }
+
+    pub fn local_exchange_split_mode_allows_final_agg(&self) -> bool {
+        self.local_exchange_split_mode_is_final_agg()
+            || self.local_exchange_split_mode_is_final_agg_and_join()
+    }
+
+    pub fn local_exchange_split_mode_allows_partitioned_join(&self) -> bool {
+        self.local_exchange_split_mode_is_final_agg_and_join()
+    }
+
+    pub(crate) fn validate_local_exchange_split_mode(mode: &str) -> Result<(), DataFusionError> {
+        if mode.eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_OFF)
+            || mode.eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG)
+            || mode.eq_ignore_ascii_case(LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG_AND_JOIN)
+        {
+            return Ok(());
+        }
+
+        plan_err!(
+            "invalid distributed.local_exchange_split_mode '{}'; expected one of: {}, {}, {}",
+            mode,
+            LOCAL_EXCHANGE_SPLIT_MODE_OFF,
+            LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG,
+            LOCAL_EXCHANGE_SPLIT_MODE_FINAL_AGG_AND_JOIN
+        )
     }
 
     /// Gets the [DistributedConfig] from the [ConfigOptions]'s extensions.

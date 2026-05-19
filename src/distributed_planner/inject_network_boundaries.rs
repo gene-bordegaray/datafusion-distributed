@@ -1,4 +1,5 @@
 use crate::TaskCountAnnotation::{Desired, Maximum};
+use crate::distributed_planner::insert_local_exchange_split::insert_local_exchange_split_for_stage;
 use crate::execution_plans::ChildrenIsolatorUnionExec;
 use crate::stage::LocalStage;
 use crate::{
@@ -29,110 +30,106 @@ use uuid::Uuid;
 /// identity) rather than mutated into the plan itself. Later passes look them up via
 /// [Context::task_count].
 ///
-/// # The three-phase loop
+/// # Walk order
 ///
-/// For every stage in the plan we run the same three phases. The bottom-up walk drives them:
-/// it climbs the plan, and each time it discovers that the current node would need a network
-/// boundary below itself, it pauses and runs phases 2 and 3 to "close" the stage that's just
-/// been delimited, then resumes climbing into the next stage above.
+/// 1. Walk bottom-up from leaves, estimating leaf task counts and reconciling child task counts at
+///    each parent.
 ///
-/// ## Phase 1 — bottom-up walk, until a stage gets delimited
+///    ```text
+///                    task counts flow upward
+///                              ▲
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Repartition      │  -> child count Desired(3)
+///                  │       (Hash)         │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Aggregation      │  -> child count Desired(3)
+///                  │      (Partial)       │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │      DataSource      │  -> TaskEstimator returns Desired(3)
+///                  └──────────────────────┘
+///    ```
 ///
-/// - Starting from the leaves, we climb the plan, asking the [TaskEstimator] for a task count
-///   at each leaf and merging children's task counts at each inner node.
-/// - We keep going until the current node is one that requires a network boundary **above it**
-///   (e.g. currently a hash `RepartitionExec` (→ shuffle), a `BroadcastExec` (→ broadcast), or any
-///   other node whose parent is `CoalescePartitionsExec` / `SortPreservingMergeExec` (→ coalesce).
-/// - At that moment, that node and the subtree underneath it form the stage we've just delimited;
-///   the boundary will be injected above it in Phase 3.
+/// 2. When the walk reaches a node that must end a stage, close that stage:
+///    - propagate the reconciled task count top-down through the stage
+///    - scale leaf nodes for that task count
+///    - insert stage-local operators that need the final stage task count, such as
+///      `LocalExchangeSplitExec`
 ///
-/// ```text
-///                ▲
-///                │   (climbing up...)
-///                │
-///                ╴   ⋯ a boundary will be injected on this edge in Phase 3 ⋯
-///                │
-///       ┌────────┴───────────┐   ← climb stops here.
-///       │   RepartitionExec  │     This node tops the producer
-///       │     (Hash, ...)    │     stage we just delimited.
-///       └────────▲───────────┘
-///                │
-///       ┌────────┴───────────┐
-///       │    AggregateExec   │
-///       │      (Partial)     │
-///       └────────▲───────────┘
-///                │
-///       ┌────────┴───────────┐
-///       │    DataSourceExec  │   ← TaskEstimator returned Desired(3)
-///       └────────────────────┘
+///    ```text
+///                     close consumer stage with T=2
+///                              ▲
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Aggregation      │  -> record Desired(2)
+///                  │  (FinalPartitioned)  │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │ LocalExchangeSplit   │  -> 4 shuffle partitions become 8 per task
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │    NetworkShuffle    │  -> record Desired(2), then stop
+///                  └───────────▲──────────┘
+///                              │
+///                     producer stage below is already closed
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Repartition      │  -> record Desired(3)
+///                  │       (Hash)         │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Aggregation      │  -> record Desired(3)
+///                  │      (Partial)       │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │  PartitionIsolator   │  -> scale leaf to 3 tasks
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │      DataSource      │  -> record Desired(3)
+///                  └──────────────────────┘
+///    ```
 ///
-///   children's task counts merge on the way up → reconciled value = T.
-/// ```
+/// 3. Wrap the closed stage in the appropriate `Network*Exec` boundary and record the starting
+///    task count for the next stage above the boundary.
 ///
-/// ## Phase 2 — top-down propagation through the stage we just delimited
-///
-/// - Starting from the input of the boundary we're about to inject, we do a top-down walk over the
-///   just delimited stage.
-/// - The `T` task count reconciled from phase 1 is assigned to every node in the stage during
-///   this top-down walk.
-/// - Leaves go through [TaskEstimator::scale_up_leaf_node] (e.g. a `DataSourceExec` may be wrapped
-///   in a `PartitionIsolatorExec`) which is called using `T` as the `task_count` argument.
-/// - If the walk meets a network boundary that was already injected by an earlier iteration of this
-///   loop, it does **not** descend into it — that subtree belongs to a previously-formed stage and
-///   has already been finalised.
-///
-/// ```text
-///   ┌─────────────────────────────┐
-///   │     RepartitionExec(Hash)   │  ← root of the stage we just delimited
-///   └──────────────┬──────────────┘
-///                  │  propagate T down
-///                  ▼
-///   ┌─────────────────────────────┐
-///   │       AggregateExec         │  ← task count := T
-///   │         (Partial)           │
-///   └──────────────┬──────────────┘
-///                  │
-///                  ▼
-///   ┌─────────────────────────────┐
-///   │       DataSourceExec        │  ← scale-up via TaskEstimator
-///   └─────────────────────────────┘    e.g.:
-///                                       ┌────────────────────┐
-///                                       │ PartitionIsolator  │ ← T
-///                                       │   ┌─────────────┐  │
-///                                       │   │ DataSource  │  │ ← T
-///                                       │   └─────────────┘  │
-///                                       └────────────────────┘
-/// ```
-///
-/// ## Phase 3 — inject the boundary and seed the next stage's starting task count
-///
-/// - Now we wrap the producer stage in the appropriate `Network*Exec` node and decide the task
-///   count above the boundary — i.e. the starting task count for the next stage up.
-/// - We compute a scale factor from the cardinality effects of the producer-stage nodes
-///   and apply it as `ceil(T_producer × sf)`.
-/// - That becomes the new node's recorded task count and feeds back into Phase 1 for the next stage.
-///
-/// ```text
-///                       ▲
-///                       │   bottom-up walk resumes;
-///                       │   reconciled with siblings → Phase 1 for the next stage
-///                       │
-///         ┌─────────────┴────────────┐
-///         │   NetworkShuffleExec     │  ← task count = ceil(T_producer × sf)
-///         └─────────────▲────────────┘
-///                       │
-///         ┌─────────────┴────────────┐
-///         │ producer stage as input  │  ← entire subtree, every node already
-///         │      (LocalStage)        │     has its task count recorded by Phase 2
-///         └──────────────────────────┘
-/// ```
+///    ```text
+///                  ┌──────────────────────┐
+///                  │    Parent Operator   │  -> next stage starts at Desired(2)
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │    NetworkShuffle    │  -> ceil(3 tasks * 0.67 scale) = 2
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Repartition      │  -> closed stage still runs with 3 tasks
+///                  │       (Hash)         │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │     Aggregation      │  -> producer stage task count is 3
+///                  │      (Partial)       │
+///                  └───────────▲──────────┘
+///                              │
+///                  ┌───────────┴──────────┐
+///                  │      DataSource      │  -> producer stage task count is 3
+///                  └──────────────────────┘
+///    ```
 ///
 /// # Exit condition
 ///
 /// When the bottom-up walk reaches the root, there is no parent that could trigger another
-/// boundary injection, so the head stage is closed by running one final Phase 2 pass over
-/// the whole plan. This guarantees every node (including head-stage nodes that never sat
-/// directly above a boundary) has a task count recorded.
+/// boundary injection, so the head stage is closed in the same way but without wrapping it in a
+/// new boundary.
 pub(super) async fn inject_network_boundaries(
     plan: Arc<dyn ExecutionPlan>,
     cfg: &ConfigOptions,
@@ -205,6 +202,47 @@ impl<'a> Context<'a> {
 
     fn fetch_add_stage_id(&self) -> usize {
         self.stage_id.fetch_add(1, Ordering::Acquire)
+    }
+
+    /// Records the final task count through one stage and applies stage-local rewrites that need
+    /// that task count before a network boundary is built from the stage's properties.
+    fn close_stage(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        task_count: TaskCountAnnotation,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = propagate_task_count_until_network_boundaries(plan, task_count, self)?;
+        self.finalize_closed_stage(plan, task_count)
+    }
+
+    /// Applies rewrites that are allowed to change only the closed stage, not producer stages
+    /// behind any network boundaries it reads from.
+    fn finalize_closed_stage(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        task_count: TaskCountAnnotation,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let transformed =
+            insert_local_exchange_split_for_stage(plan, self.d_cfg, task_count.as_usize())?;
+        if transformed.transformed {
+            self.record_task_count_within_stage(&transformed.data, task_count);
+        }
+        Ok(transformed.data)
+    }
+
+    /// Re-records task counts after a stage-local rewrite rebuilt plan nodes.
+    fn record_task_count_within_stage(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        task_count: TaskCountAnnotation,
+    ) {
+        self.set_task_count(plan, task_count);
+        if plan.is_network_boundary() {
+            return;
+        }
+        for child in plan.children() {
+            self.record_task_count_within_stage(child, task_count);
+        }
     }
 }
 
@@ -285,9 +323,7 @@ async fn _inject_network_boundaries(
     // Upon reaching a hash repartition, we need to introduce a shuffle right above it.
     if let Some(r_exec) = plan.as_any().downcast_ref::<RepartitionExec>() {
         if matches!(r_exec.partitioning(), Partitioning::Hash(_, _)) {
-            // The subtree below this point belongs to one stage. Propagate the chosen task
-            // count down so every node in that stage has it recorded.
-            let plan = propagate_task_count_until_network_boundaries(&plan, task_count, ctx)?;
+            let plan = ctx.close_stage(&plan, task_count)?;
 
             let f = calculate_scale_factor(&plan, ctx);
             let input_stage = LocalStage {
@@ -313,9 +349,7 @@ async fn _inject_network_boundaries(
     {
         // A BroadcastExec underneath a coalesce parent means the build side will cross stages.
         return if plan.as_any().is::<BroadcastExec>() {
-            // The subtree below this point belongs to one stage. Propagate the chosen task
-            // count down so every node in that stage has it recorded.
-            let plan = propagate_task_count_until_network_boundaries(&plan, task_count, ctx)?;
+            let plan = ctx.close_stage(&plan, task_count)?;
 
             let f = calculate_scale_factor(&plan, ctx);
             let input_stage = LocalStage {
@@ -328,9 +362,7 @@ async fn _inject_network_boundaries(
             let task_count = Desired((f * task_count.as_usize() as f64).ceil() as usize);
             Ok(ctx.plan_with_task_count(plan, task_count))
         } else {
-            // The subtree below this point belongs to one stage. Propagate the chosen task
-            // count down so every node in that stage has it recorded.
-            let plan = propagate_task_count_until_network_boundaries(&plan, task_count, ctx)?;
+            let plan = ctx.close_stage(&plan, task_count)?;
             let input_stage = LocalStage {
                 query_id: ctx.query_id,
                 num: ctx.fetch_add_stage_id(),
@@ -349,7 +381,7 @@ async fn _inject_network_boundaries(
         // We've just finished walking the head stage's subplan. Run a final propagation so
         // every node in the head stage (which never crossed a stage boundary on the way up)
         // gets its task count recorded.
-        propagate_task_count_until_network_boundaries(&plan, task_count, ctx)
+        ctx.close_stage(&plan, task_count)
     } else {
         // If this is not the root node, and it's also not a network boundary, then we don't need
         // to do anything else.
@@ -382,10 +414,8 @@ async fn _inject_network_boundaries(
 /// - **Leaves**: ask the [TaskEstimator] for an optional scaled-up replacement (e.g. wrapping a
 ///   `DataSourceExec` in a `PartitionIsolatorExec`). Every node in the returned subtree —
 ///   including any wrappers the estimator introduced — is recorded with `task_count`.
-/// - **Network boundaries**: don't descend into the boundary's input plan (it lives in another
-///   stage). Instead, rescale the boundary's input via [network_boundary_scale_input] using the
-///   *consumer* partition and task counts of this side of the boundary, and stitch the rescaled
-///   stage back in via [NetworkBoundary::with_input_stage].
+/// - **Network boundaries**: record the boundary task count and stop. The boundary input lives in
+///   another stage and is prepared later by `prepare_network_boundaries`.
 /// - **Eligible `UnionExec`s** (when `children_isolator_unions` is on): rewrite to
 ///   [ChildrenIsolatorUnionExec] and recurse into each child with the per-child task count
 ///   chosen by [ChildrenIsolatorUnionExec::from_children_and_task_counts] — each child runs
@@ -582,11 +612,12 @@ mod tests {
               SortExec: task_count=Desired(2)
                 ProjectionExec: task_count=Desired(2)
                   AggregateExec: task_count=Desired(2)
-                    NetworkShuffleExec: task_count=Desired(2)
-                      RepartitionExec: task_count=Desired(3)
-                        AggregateExec: task_count=Desired(3)
-                          PartitionIsolatorExec: task_count=Desired(3)
-                            DataSourceExec: task_count=Desired(3)
+                    LocalExchangeSplitExec: task_count=Desired(2)
+                      NetworkShuffleExec: task_count=Desired(2)
+                        RepartitionExec: task_count=Desired(3)
+                          AggregateExec: task_count=Desired(3)
+                            PartitionIsolatorExec: task_count=Desired(3)
+                              DataSourceExec: task_count=Desired(3)
         ")
     }
 
@@ -636,13 +667,14 @@ mod tests {
             NetworkCoalesceExec: task_count=Maximum(1)
               ProjectionExec: task_count=Desired(2)
                 AggregateExec: task_count=Desired(2)
-                  NetworkShuffleExec: task_count=Desired(2)
-                    RepartitionExec: task_count=Desired(3)
-                      AggregateExec: task_count=Desired(3)
-                        FilterExec: task_count=Desired(3)
-                          RepartitionExec: task_count=Desired(3)
-                            PartitionIsolatorExec: task_count=Desired(3)
-                              DataSourceExec: task_count=Desired(3)
+                  LocalExchangeSplitExec: task_count=Desired(2)
+                    NetworkShuffleExec: task_count=Desired(2)
+                      RepartitionExec: task_count=Desired(3)
+                        AggregateExec: task_count=Desired(3)
+                          FilterExec: task_count=Desired(3)
+                            RepartitionExec: task_count=Desired(3)
+                              PartitionIsolatorExec: task_count=Desired(3)
+                                DataSourceExec: task_count=Desired(3)
           ProjectionExec: task_count=Maximum(1)
             AggregateExec: task_count=Maximum(1)
               NetworkShuffleExec: task_count=Maximum(1)
@@ -679,11 +711,12 @@ mod tests {
         let annotated = sql_to_annotated(query).await;
         assert_snapshot!(annotated, @r"
         AggregateExec: task_count=Desired(2)
-          NetworkShuffleExec: task_count=Desired(2)
-            RepartitionExec: task_count=Desired(3)
-              AggregateExec: task_count=Desired(3)
-                PartitionIsolatorExec: task_count=Desired(3)
-                  DataSourceExec: task_count=Desired(3)
+          LocalExchangeSplitExec: task_count=Desired(2)
+            NetworkShuffleExec: task_count=Desired(2)
+              RepartitionExec: task_count=Desired(3)
+                AggregateExec: task_count=Desired(3)
+                  PartitionIsolatorExec: task_count=Desired(3)
+                    DataSourceExec: task_count=Desired(3)
         ")
     }
 

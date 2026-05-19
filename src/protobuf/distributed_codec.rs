@@ -1,7 +1,8 @@
 use super::get_distributed_user_codecs;
 use crate::common::{deserialize_uuid, serialize_uuid};
 use crate::execution_plans::{
-    BroadcastExec, ChildrenIsolatorUnionExec, NetworkBroadcastExec, NetworkCoalesceExec,
+    BroadcastExec, ChildrenIsolatorUnionExec, LocalExchangeSplitExec, NetworkBroadcastExec,
+    NetworkCoalesceExec,
 };
 use crate::stage::{LocalStage, RemoteStage, Stage};
 use crate::worker::WorkerConnectionPool;
@@ -238,6 +239,43 @@ impl PhysicalExtensionCodec for DistributedCodec {
                         .collect(),
                 }))
             }
+            DistributedExecNode::LocalExchangeSplit(LocalExchangeSplitExecProto {
+                partitioning,
+                base_partition_count,
+                local_partition_count,
+            }) => {
+                if inputs.len() != 1 {
+                    return Err(proto_error(format!(
+                        "LocalExchangeSplitExec expects exactly one child, got {}",
+                        inputs.len()
+                    )));
+                }
+
+                let child = inputs.first().unwrap();
+                let schema = child.schema();
+                let partitioning = parse_protobuf_partitioning(
+                    partitioning.as_ref(),
+                    ctx,
+                    &schema,
+                    &DistributedCodec {},
+                    &DefaultPhysicalProtoConverter,
+                )?
+                .ok_or(proto_error(
+                    "LocalExchangeSplitExec is missing partitioning",
+                ))?;
+                let Partitioning::Hash(hash_exprs, _) = partitioning else {
+                    return Err(proto_error(
+                        "LocalExchangeSplitExec requires hash partitioning metadata",
+                    ));
+                };
+
+                Ok(Arc::new(LocalExchangeSplitExec::try_new(
+                    child.clone(),
+                    hash_exprs,
+                    base_partition_count as usize,
+                    local_partition_count as usize,
+                )?))
+            }
         }
     }
 
@@ -357,6 +395,22 @@ impl PhysicalExtensionCodec for DistributedCodec {
             };
 
             wrapper.encode(buf).map_err(|e| proto_error(format!("{e}")))
+        } else if let Some(node) = node.as_any().downcast_ref::<LocalExchangeSplitExec>() {
+            let inner = LocalExchangeSplitExecProto {
+                partitioning: Some(serialize_partitioning(
+                    node.properties().output_partitioning(),
+                    &DistributedCodec {},
+                    &DefaultPhysicalProtoConverter,
+                )?),
+                base_partition_count: node.base_partition_count() as u64,
+                local_partition_count: node.local_partition_count() as u64,
+            };
+
+            let wrapper = DistributedExecProto {
+                node: Some(DistributedExecNode::LocalExchangeSplit(inner)),
+            };
+
+            wrapper.encode(buf).map_err(|e| proto_error(format!("{e}")))
         } else {
             Err(proto_error(format!("Unexpected plan {}", node.name())))
         }
@@ -387,7 +441,7 @@ pub struct ExecutionTaskProto {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DistributedExecProto {
-    #[prost(oneof = "DistributedExecNode", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "DistributedExecNode", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub node: Option<DistributedExecNode>,
 }
 
@@ -405,12 +459,24 @@ pub enum DistributedExecNode {
     NetworkBroadcast(NetworkBroadcastExecProto),
     #[prost(message, tag = "6")]
     Broadcast(BroadcastExecProto),
+    #[prost(message, tag = "7")]
+    LocalExchangeSplit(LocalExchangeSplitExecProto),
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionIsolatorExecProto {
     #[prost(uint64, tag = "1")]
     pub n_tasks: u64,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LocalExchangeSplitExecProto {
+    #[prost(message, optional, tag = "1")]
+    partitioning: Option<protobuf::Partitioning>,
+    #[prost(uint64, tag = "2")]
+    base_partition_count: u64,
+    #[prost(uint64, tag = "3")]
+    local_partition_count: u64,
 }
 
 /// Protobuf representation of the [NetworkShuffleExec] physical node. It serves as
@@ -613,6 +679,29 @@ mod tests {
         codec.try_encode(plan.clone(), &mut buf)?;
 
         let decoded = codec.try_decode(&buf, &[flight], &ctx)?;
+        assert_eq!(repr(&plan), repr(&decoded));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_local_exchange_split() -> datafusion::common::Result<()> {
+        let codec = DistributedCodec;
+        let ctx = create_context();
+
+        let schema = schema_i32("a");
+        let child: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(LocalExchangeSplitExec::try_new(
+            child.clone(),
+            vec![Arc::new(Column::new("a", 0))],
+            2,
+            4,
+        )?);
+
+        let mut buf = Vec::new();
+        codec.try_encode(plan.clone(), &mut buf)?;
+
+        let decoded = codec.try_decode(&buf, &[child], &ctx)?;
         assert_eq!(repr(&plan), repr(&decoded));
 
         Ok(())
