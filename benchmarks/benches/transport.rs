@@ -19,6 +19,13 @@ fn transport(c: &mut Criterion) {
         TransportBench::one_to_one_baseline(TransportBenchMode::Tcp),
         TransportBench::many_to_one_baseline(TransportBenchMode::InMemory, 8),
         TransportBench::many_to_one_baseline(TransportBenchMode::Tcp, 8),
+        TransportBench::one_to_many_baseline(TransportBenchMode::Tcp, 16)
+            .with_partitions(16)
+            .with_total_rows(8_192),
+        TransportBench::one_to_many_baseline(TransportBenchMode::Tcp, 16)
+            .with_partitions(16)
+            .with_total_rows(8_192)
+            .with_compression(Some(CompressionType::LZ4_FRAME)),
         TransportBench::one_to_many_baseline(TransportBenchMode::InMemory, 16)
             .with_partitions(16)
             .with_total_rows(2_000_000),

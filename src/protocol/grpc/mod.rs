@@ -2,6 +2,7 @@ mod channel_resolver;
 mod errors;
 mod generated;
 mod metrics_proto;
+mod multiplexed_flight;
 mod observability;
 mod on_drop_stream;
 mod spawn_select_all;

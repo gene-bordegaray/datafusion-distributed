@@ -1,9 +1,10 @@
 use super::errors::{datafusion_error_to_tonic_status, map_status_to_datafusion_error};
 use super::generated::worker as pb;
 use super::metrics_proto::df_metrics_set_to_proto;
+use super::multiplexed_flight::{MultiplexedFlightDataEncoder, PartitionedBatch};
 use super::spawn_select_all::spawn_select_all;
 
-use crate::common::{deserialize_uuid, now_ns};
+use crate::common::deserialize_uuid;
 use crate::protocol::grpc::{ObservabilityServiceImpl, ObservabilityServiceServer};
 use crate::{
     CoordinatorToWorkerMsg, DistributedConfig, ExecuteTaskRequest, LoadInfo, MaybeEncoded,
@@ -12,7 +13,6 @@ use crate::{
 };
 
 use arrow_flight::FlightData;
-use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use async_trait::async_trait;
@@ -20,10 +20,9 @@ use datafusion::arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::ipc::CompressionType;
 use datafusion::arrow::ipc::writer::IpcWriteOptions;
 use datafusion::common::DataFusionError;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::TaskContext;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use prost::Message;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use url::Url;
@@ -168,33 +167,36 @@ impl pb::worker_service_server::WorkerService for Worker {
                 "Unknown compression type {v}"
             )))?,
         };
-        let mut flight_streams = Vec::with_capacity(arrow_streams.len());
-        for (partition, arrow_stream) in partition_range.zip(arrow_streams) {
-            let flight_stream =
-                build_flight_data_stream(arrow_stream, compression)?.map(move |msg| {
-                    // For each FlightData produced by this stream, mark it with the appropriate
-                    // partition. This stream will be merged with several others from other partitions,
-                    // so marking it with the original partition allows it to be deconstructed into
-                    // the original per-partition streams in later steps.
-                    let flight_data = pb::FlightAppMetadata {
-                        partition: partition as u64,
-                        created_timestamp_unix_nanos: now_ns::<u64>(),
-                    };
-                    msg.map(|v| v.with_app_metadata(flight_data.encode_to_vec()))
-                });
+        let Some(schema) = arrow_streams.first().map(|stream| stream.schema()) else {
+            return Ok(Response::new(Box::pin(futures::stream::empty())));
+        };
 
-            flight_streams.push(flight_stream);
+        let mut partitioned_streams = Vec::with_capacity(arrow_streams.len());
+        for (partition, arrow_stream) in partition_range.zip(arrow_streams) {
+            partitioned_streams.push(
+                arrow_stream
+                    .and_then(|batch| std::future::ready(garbage_collect_arrays(batch)))
+                    .map_ok(move |batch| PartitionedBatch { partition, batch })
+                    .map_err(|error| {
+                        FlightError::Tonic(Box::new(datafusion_error_to_tonic_status(error)))
+                    })
+                    .boxed(),
+            );
         }
 
-        // Merge all the per-partition streams into one. Each message in the stream is marked with
-        // the original partition, so they can be reconstructed at the other side of the boundary.
         let memory_pool = Arc::clone(&task_ctx.runtime_env().memory_pool);
-        let stream = spawn_select_all(flight_streams, memory_pool, RECORD_BATCH_BUFFER_SIZE);
+        let batches = spawn_select_all(partitioned_streams, memory_pool, RECORD_BATCH_BUFFER_SIZE);
+        let options = IpcWriteOptions::default()
+            .try_with_compression(compression)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let stream = MultiplexedFlightDataEncoder::new(batches, schema, options);
 
-        Ok(Response::new(Box::pin(stream.map_err(|err| match err {
-            FlightError::Tonic(status) => *status,
-            _ => Status::internal(format!("Error during flight stream: {err}")),
-        }))))
+        Ok(Response::new(Box::pin(stream.map_err(
+            |error| match error {
+                FlightError::Tonic(status) => *status,
+                _ => Status::internal(format!("Error during flight stream: {error}")),
+            },
+        ))))
     }
 
     async fn get_worker_info(
@@ -399,44 +401,6 @@ fn empty(stream_name: &'static str) -> impl FnOnce() -> Status {
 
 fn missing(field: &'static str) -> impl FnOnce() -> Status {
     move || Status::invalid_argument(format!("Missing field '{field}'"))
-}
-
-fn build_flight_data_stream(
-    stream: SendableRecordBatchStream,
-    compression_type: Option<CompressionType>,
-) -> datafusion::common::Result<FlightDataEncoder, Status> {
-    let stream = FlightDataEncoderBuilder::new()
-        .with_options(
-            IpcWriteOptions::default()
-                .try_with_compression(compression_type)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        )
-        .with_schema(stream.schema())
-        // This tells the encoder to send dictionaries across the wire as-is.
-        // The alternative (`DictionaryHandling::Hydrate`) would expand the dictionaries
-        // into their value types, which can potentially blow up the size of the data transfer.
-        // The main reason to use `DictionaryHandling::Hydrate` is for compatibility with clients
-        // that do not support dictionaries, but since we are using the same server/client on both
-        // sides, we can safely use `DictionaryHandling::Resend`.
-        // Note that we do garbage collection of unused dictionary values above, so we are not sending
-        // unused dictionary values over the wire.
-        .with_dictionary_handling(DictionaryHandling::Resend)
-        // Set max flight data size to unlimited.
-        // This requires servers and clients to also be configured to handle unlimited sizes.
-        // Using unlimited sizes avoids splitting RecordBatches into multiple FlightData messages,
-        // which could add significant overhead for large RecordBatches.
-        // The only reason to split them really is if the client/server are configured with a message size limit,
-        // which mainly makes sense in a public network scenario where you want to avoid DoS attacks.
-        // Since all of our Arrow Flight communication happens within trusted data plane networks,
-        // we can safely use unlimited sizes here.
-        .with_max_flight_data_size(usize::MAX)
-        .build(
-            stream
-                // Apply garbage collection of dictionary and view arrays before sending over the network
-                .and_then(|rb| std::future::ready(garbage_collect_arrays(rb)))
-                .map_err(|err| FlightError::Tonic(Box::new(datafusion_error_to_tonic_status(err)))),
-        );
-    Ok(stream)
 }
 
 /// Garbage collects values sub-arrays.

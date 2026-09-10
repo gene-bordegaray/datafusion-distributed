@@ -1,6 +1,5 @@
 #![allow(clippy::upper_case_acronyms, clippy::vec_box)]
 
-use arrow_flight::error::FlightError;
 use datafusion::common::internal_datafusion_err;
 use datafusion::error::DataFusionError;
 use prost::Message;
@@ -57,13 +56,4 @@ pub fn tonic_status_to_datafusion_error(
 pub fn map_status_to_datafusion_error(err: tonic::Status) -> DataFusionError {
     tonic_status_to_datafusion_error(&err)
         .unwrap_or_else(|| DataFusionError::External(Box::new(err)))
-}
-
-/// Same as [tonic_status_to_datafusion_error] but suitable to be used in `.map_err` calls that
-/// accept a [FlightError] error.
-pub fn map_flight_to_datafusion_error(err: FlightError) -> DataFusionError {
-    match err {
-        FlightError::Tonic(status) => map_status_to_datafusion_error(*status),
-        err => DataFusionError::External(Box::new(err)),
-    }
 }

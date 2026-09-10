@@ -1,5 +1,5 @@
 use super::channel_resolver::BoxCloneSyncChannel;
-use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
+use super::errors::map_status_to_datafusion_error;
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
 use crate::common::serialize_uuid;
@@ -13,8 +13,7 @@ use crate::{
     TaskCompletedDynamicFilters, TaskDynamicFilter, TaskKey, TaskMetrics, WorkUnitBatch,
     WorkUnitFeedDeclaration, WorkUnitMsg, WorkerChannel, WorkerToCoordinatorMsg,
 };
-use arrow_flight::FlightData;
-use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -179,18 +178,24 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 Extensions::default(),
                 request_for_task,
             );
-            let mut interleaved_stream = match self_clone.execute_task(request).await {
+            let interleaved_stream = match self_clone.execute_task(request).await {
                 Ok(v) => v.into_inner(),
                 Err(err) => return fanout(&per_partition_tx, err),
             };
+            let flight_stream = interleaved_stream.map(move |message| {
+                message
+                    .map(|data| {
+                        msg_count.add(1);
+                        bytes_transferred.add_bytes(data.encoded_len());
+                        data
+                    })
+                    .map_err(|error| FlightError::Tonic(Box::new(error)))
+            });
+            let mut decoder = FlightDataDecoder::new(flight_stream);
 
             loop {
-                // Backpressure gate. Per-partition channels are unbounded, so we cap
-                // total in-flight buffered bytes here by pausing the gRPC pull when
-                // consumers haven't drained enough. This propagates flow control all
-                // the way back to the worker without coupling sibling partitions.
-                // We always allow a message through when reservation == 0 to avoid
-                // livelock if a single message is larger than the budget.
+                // Per-partition queues are unbounded, so pause the shared decoder when
+                // queued decoded batches reach the connection budget.
                 while memory_reservation.size() >= buffer_budget_bytes {
                     tokio::select! {
                         biased;
@@ -199,78 +204,67 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     }
                 }
 
-                // Check for cancellation while waiting for the next message.
-                let flight_data = tokio::select! {
+                let decoded = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    msg = interleaved_stream.next() => {
-                        match msg {
-                            Some(Ok(v)) => v,
-                            Some(Err(err)) => return fanout(&per_partition_tx, err),
-                            None => return, // Stream exhausted
+                    message = decoder.next() => match message {
+                        Some(Ok(decoded)) => decoded,
+                        Some(Err(FlightError::Tonic(status))) => {
+                            return fanout(&per_partition_tx, *status)
                         }
+                        Some(Err(error)) => {
+                            return fanout(&per_partition_tx, Status::internal(error.to_string()))
+                        }
+                        None => return,
                     }
                 };
 
-                // Earliest time at which the msg was received.
-                let msg_received_time = SystemTime::now();
-
-                let flight_metadata = match FlightAppMetadata::decode(flight_data.app_metadata.as_ref()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return fanout(&per_partition_tx, Status::internal(err.to_string()));
+                let app_metadata = decoded.app_metadata();
+                let DecodedPayload::RecordBatch(batch) = decoded.payload else {
+                    continue;
+                };
+                let flight_metadata = match FlightAppMetadata::decode(app_metadata) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return fanout(&per_partition_tx, Status::internal(error.to_string()));
                     }
                 };
 
-                // Update the running latency tracker.
-                let sent_time = UNIX_EPOCH + Duration::from_nanos(flight_metadata.created_timestamp_unix_nanos);
+                let received_time = SystemTime::now();
+                let sent_time = UNIX_EPOCH
+                    + Duration::from_nanos(flight_metadata.created_timestamp_unix_nanos);
                 if flight_metadata.created_timestamp_unix_nanos > 0
-                    && let Ok(delta) = msg_received_time.duration_since(sent_time) {
+                    && let Ok(delta) = received_time.duration_since(sent_time)
+                {
                     latency_metrics.add_duration(delta);
                 }
 
                 let partition = flight_metadata.partition as usize;
-                // the `per_partition_tx` variable is using a normal `Vec` for storing the
-                // channel transmitters, so we need to subtract the `target_partition_range.start`
-                // to the `partition` in order to offset it to the appropriate index.
                 let Some(sender_i) = partition.checked_sub(target_partition_range.start) else {
-                    let msg = format!(
+                    let message = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
-                    return fanout(&per_partition_tx, Status::internal(msg));
+                    return fanout(&per_partition_tx, Status::internal(message));
                 };
-
-                let Some(o_tx) = per_partition_tx.get(sender_i) else {
-                    let msg = format!(
+                let Some(sender) = per_partition_tx.get(sender_i) else {
+                    let message = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
-                    return fanout(&per_partition_tx, Status::internal(msg));
+                    return fanout(&per_partition_tx, Status::internal(message));
                 };
 
-                // We need to send the memory reservation in the same tuple as the actual message
-                // so that it gets dropped as soon as the message leaves the queue. Dropping the
-                // memory reservation means releasing the memory from the pool for that specific
-                // message
-                let size = flight_data.encoded_len();
+                let size = batch.get_array_memory_size();
                 memory_reservation.grow(size);
-
-                // Update memory related metrics.
-                msg_count.add(1);
-                bytes_transferred.add_bytes(size);
-                let curr_mem = memory_reservation.size();
-                if curr_mem > curr_max_mem {
-                    curr_max_mem = curr_mem;
+                let current_memory = memory_reservation.size();
+                if current_memory > curr_max_mem {
+                    curr_max_mem = current_memory;
                     max_mem_used.set(curr_max_mem);
                 }
 
-                if o_tx.send(Ok((flight_data, flight_metadata))).is_err() {
-                    // The receiver for this partition was dropped (e.g. a hash join partition
-                    // completed early without consuming its probe side). Don't exit: other
-                    // partitions multiplexed over the same gRPC stream still need their data.
-                    // Undo the memory reservation that was grown for this dropped batch.
+                if sender.send(Ok((batch, size))).is_err() {
+                    // A dropped lane must not cancel siblings sharing this decoder.
                     memory_reservation.shrink(size);
-                    continue;
-                };
+                }
             }
         }.with_elapsed_compute(elapsed_compute));
 
@@ -289,19 +283,17 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
             }
             .flatten_stream();
 
-            let stream = stream.map_err(|err| FlightError::Tonic(Box::new(err)));
             let reservation = Arc::clone(&memory_reservation_clone);
             let mem_available_notify = Arc::clone(&mem_available_notify);
-            let stream = stream.map_ok(move |(data, _meta)| {
-                reservation.shrink(data.encoded_len());
-                // Wake the demux task in case it is blocked on the byte budget.
-                mem_available_notify.notify_one();
-                let _ = &task; // <- keep the task that polls data from the network alive.
-                data
-            });
-            let stream = FlightRecordBatchStream::new_from_flight_data(stream);
-            let stream = stream.map_err(map_flight_to_datafusion_error);
-            let stream = stream.with_elapsed_compute(elapsed_compute_clone.clone());
+            let stream = stream
+                .map_ok(move |(batch, size)| {
+                    reservation.shrink(size);
+                    mem_available_notify.notify_one();
+                    let _ = &task; // Keep the shared decoder task alive.
+                    batch
+                })
+                .map_err(map_status_to_datafusion_error)
+                .with_elapsed_compute(elapsed_compute_clone.clone());
 
             // When the stream is dropped, cancel the background task to ensure prompt cleanup.
             let not_consumed_streams = Arc::clone(&not_consumed_streams);
@@ -334,7 +326,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
     }
 }
 
-type WorkerMsg = Result<(FlightData, FlightAppMetadata), Status>;
+type WorkerMsg = Result<(RecordBatch, usize), Status>;
 
 struct NetworkLatencyMetrics {
     metrics: ExecutionPlanMetricsSet,
